@@ -21,13 +21,13 @@ MIN_SUBSPACE_SIZE = 0.05  # 5 cm
 # Robot base footprint 尺寸
 ROBOT_LOC_SIZE_X = 0.40   # 40 cm
 ROBOT_LOC_SIZE_Y = 0.40   # 40 cm
-ROBOT_THICKNESS  = 0.01   # 1 cm
+ROBOT_THICKNESS  = 0.03   # 1 cm
 
 # Robot 相对 workspace 的偏移距离（单位米）
-ROBOT_OFFSET_DISTANCE = 0.15  # 15 cm
+ROBOT_OFFSET_DISTANCE = 0  # 15 cm
 
 # 厚度阈值，用于过滤墙面等（Z 方向 thickness）
-MAX_PLANE_THICKNESS = 2  # 2m
+MAX_PLANE_THICKNESS = 2.0  # 2m
 
 # 可操作平面高度范围（台面高度）
 MIN_Z_TOP = 0.6   # 0.6 m
@@ -49,8 +49,8 @@ EXCLUDE_NAME_KEYWORDS = [
 MIN_LARGE_OBJECT_AREA = 0.05 * 0.05    # 0.0025 m^2
 
 # 碰撞判定参数
-COLLISION_RATIO_THRESHOLD = 0.3  # 严重碰撞阈值 (30%)
-SHRINK_STEP = 0.05              # 收缩步长 (3 cm)
+COLLISION_RATIO_THRESHOLD = 1  # 严重碰撞阈值 (30%)
+SHRINK_STEP = 0.05              # 收缩步长 (5 cm),收缩次数20次
 MIN_IGNORE_COLLISION_AREA = 0.05 * 0.05 # 忽略不计的微小碰撞面积 (5cm*5cm)
 
 ENABLE_ROOM_Y_FILTER = True
@@ -152,7 +152,7 @@ def optimize_space_box(center, size, obstacles, self_actor_path, space_type_name
     
     iteration = 0
     max_iter = 20
-    last_hit_name = "None" # 记录上一次碰到的物体
+    last_hit_name = "None"
     
     while iteration < max_iter:
         iteration += 1
@@ -176,7 +176,6 @@ def optimize_space_box(center, size, obstacles, self_actor_path, space_type_name
             final_center = ((curr_min_x + curr_max_x)*0.5, (curr_min_y + curr_max_y)*0.5, curr_cz)
             final_size = (curr_sx, curr_sy, curr_sz)
             if iteration > 1:
-                # 修复: 成功时 hit_name 是 None，所以用 last_hit_name 记录我们到底避开了谁
                 return final_center, final_size, f"Optimized (Iter {iteration}): Shrunk to avoid {last_hit_name}", True
             else:
                 return final_center, final_size, "Clean", True
@@ -186,7 +185,7 @@ def optimize_space_box(center, size, obstacles, self_actor_path, space_type_name
             return None, None, f"Severe Collision ({ratio:.1%}) with {hit_name}", False
         
         # Case C: Shrink
-        last_hit_name = hit_name # 记录这次碰到了谁
+        last_hit_name = hit_name
         hit_center = (hit_box.GetMin() + hit_box.GetMax()) * 0.5
         box_center_x = (curr_min_x + curr_max_x) * 0.5
         box_center_y = (curr_min_y + curr_max_y) * 0.5
@@ -203,7 +202,7 @@ def optimize_space_box(center, size, obstacles, self_actor_path, space_type_name
             
     return None, None, "Max Iterations Reached", False
 
-# ----------------- Actor 分析逻辑 (带Debug) -----------------
+# ----------------- Actor 分析逻辑 -----------------
 
 def list_meshes_under_actor(actor_prim):
     meshes = []
@@ -229,9 +228,6 @@ def get_actor_surface_info(actor_prim, bbox_cache):
     return rect_size_from_bbox(overall_box)
 
 def check_candidate_actor_surface(actor_prim, bbox_cache):
-    """
-    修改后的检测函数，返回 (Success, Reason_String, Info)
-    """
     if is_excluded_by_name(actor_prim.GetPath().pathString):
         return False, "Excluded by name (keyword)", None
 
@@ -241,17 +237,14 @@ def check_candidate_actor_surface(actor_prim, bbox_cache):
 
     (cx, cy, z_top), (sx, sy), (_, _, sz) = info
 
-    # Check 1: Thickness
     if sz > MAX_PLANE_THICKNESS:
         return False, f"Too thick (Z={sz:.2f}m > {MAX_PLANE_THICKNESS}m)", None
 
-    # Check 2: Width/Depth
     cond1 = (sx >= MIN_WORKSPACE_WIDTH and sy >= MIN_WORKSPACE_DEPTH)
     cond2 = (sy >= MIN_WORKSPACE_WIDTH and sx >= MIN_WORKSPACE_DEPTH)
     if not (cond1 or cond2):
         return False, f"Too small (Size={sx:.2f}x{sy:.2f} < Min {MIN_WORKSPACE_WIDTH})", None
 
-    # Check 3: Height
     if not (MIN_Z_TOP <= z_top <= MAX_Z_TOP):
         return False, f"Invalid height (Z_top={z_top:.2f}m not in [{MIN_Z_TOP}, {MAX_Z_TOP}])", None
 
@@ -294,7 +287,7 @@ def generate_workspaces(scene_usd_path):
         all_obstacles.append((path_str, obs_bbox))
     print(f"[INFO] Found {len(all_obstacles)} potential obstacles.")
 
-    # 2. Room Y Filter Stats
+    # 2. Room Y Filter
     room_y_samples = []
     if ENABLE_ROOM_Y_FILTER:
         for prim in stage.Traverse():
@@ -314,7 +307,6 @@ def generate_workspaces(scene_usd_path):
     # 3. Processing
     workspace_count = 0
     
-    # 遍历所有 prim，只要名字里有 Actor 就做检查
     for prim in stage.Traverse():
         name = prim.GetName()
         if not name.startswith("Actor_"): continue
@@ -388,40 +380,68 @@ def generate_workspaces(scene_usd_path):
             continue
         reasons.append(f"Disturb: {d_status}")
 
-        # --- C. RobotLocation ---
+        # --- C. RobotLocation (Refined Search Logic) ---
         robot_size = (ROBOT_LOC_SIZE_X, ROBOT_LOC_SIZE_Y, ROBOT_THICKNESS)
         final_robot_center = None
-        
-        robot_x_pos = table_max_x + ROBOT_OFFSET_DISTANCE
-        robot_center_x_opt = (robot_x_pos + ROBOT_LOC_SIZE_X * 0.5, cy, ROBOT_THICKNESS * 0.5)
-        
-        r_ratio_x, _, _ = get_collision_info(
-            Gf.Range3d(
-                Gf.Vec3d(robot_center_x_opt[0]-robot_size[0]/2, robot_center_x_opt[1]-robot_size[1]/2, 0),
-                Gf.Vec3d(robot_center_x_opt[0]+robot_size[0]/2, robot_center_x_opt[1]+robot_size[1]/2, ROBOT_THICKNESS)
-            ), all_obstacles, actor_path_str
-        )
-        
         robot_choice = ""
-        if r_ratio_x < 0.1:
-            final_robot_center = robot_center_x_opt
-            robot_choice = "Side(X)"
-        else:
-            robot_y_pos = table_min_y - ROBOT_OFFSET_DISTANCE
-            robot_center_y_opt = (cx, robot_y_pos - ROBOT_LOC_SIZE_Y * 0.5, ROBOT_THICKNESS * 0.5)
-            r_ratio_y, _, _ = get_collision_info(
-                Gf.Range3d(
-                    Gf.Vec3d(robot_center_y_opt[0]-robot_size[0]/2, robot_center_y_opt[1]-robot_size[1]/2, 0),
-                    Gf.Vec3d(robot_center_y_opt[0]+robot_size[0]/2, robot_center_y_opt[1]+robot_size[1]/2, ROBOT_THICKNESS)
-                ), all_obstacles, actor_path_str
-            )
-            if r_ratio_y < 0.1:
-                final_robot_center = robot_center_y_opt
-                robot_choice = "Front(Y)"
-            else:
-                print(f"{log_prefix} Skipped: Robot location blocked both X and Y.")
-                continue
+        found_spot = False
 
+        # 搜索偏移列表
+        # 0: 原始位置
+        # 正数: 尝试更远的位置 (更安全)
+        # 负数: 尝试更近的位置 (更紧凑)
+        search_offsets = [0.15, -0.15, -0.20, 0.20, -0.10, 0.10, -0.05, 0.05]
+
+        # 1. Try X Axis (Side)
+        # Base Position: Right Side of table
+        base_x_pos = table_max_x + ROBOT_OFFSET_DISTANCE + ROBOT_LOC_SIZE_X * 0.5
+        
+        for offset in search_offsets:
+            # X方向：正偏移 = 向右(更远)，负偏移 = 向左(更近)
+            test_cx = base_x_pos + offset
+            test_center = (test_cx, cy, ROBOT_THICKNESS * 0.5)
+            
+            test_min = Gf.Vec3d(test_cx - ROBOT_LOC_SIZE_X/2, cy - ROBOT_LOC_SIZE_Y/2, 0)
+            test_max = Gf.Vec3d(test_cx + ROBOT_LOC_SIZE_X/2, cy + ROBOT_LOC_SIZE_Y/2, ROBOT_THICKNESS)
+            
+            r_ratio, _, _ = get_collision_info(Gf.Range3d(test_min, test_max), all_obstacles, actor_path_str)
+            
+            if r_ratio < 0.1: 
+                final_robot_center = test_center
+                off_str = f"+{offset:.2f}" if offset >= 0 else f"{offset:.2f}"
+                robot_choice = f"Side(X) {off_str}"
+                found_spot = True
+                break
+        
+        # 2. Try Y Axis (Front) - Fallback with Search
+        if not found_spot:
+            # Base Position: Front of table (Y minus direction)
+            base_y_pos = table_min_y - ROBOT_OFFSET_DISTANCE - ROBOT_LOC_SIZE_Y * 0.5
+            
+            for offset in search_offsets:
+                # Y方向：前方是负Y轴。
+                # 正偏移 = 向前(负Y方向, 更远) => 需要减去 offset
+                # 负偏移 = 向后(正Y方向, 更近) => 减去负数 = 加上
+                test_cy = base_y_pos - offset
+                test_center = (cx, test_cy, ROBOT_THICKNESS * 0.5)
+                
+                test_min = Gf.Vec3d(cx - ROBOT_LOC_SIZE_X/2, test_cy - ROBOT_LOC_SIZE_Y/2, 0)
+                test_max = Gf.Vec3d(cx + ROBOT_LOC_SIZE_X/2, test_cy + ROBOT_LOC_SIZE_Y/2, ROBOT_THICKNESS)
+                
+                r_ratio_y, _, _ = get_collision_info(Gf.Range3d(test_min, test_max), all_obstacles, actor_path_str)
+                
+                if r_ratio_y < 0.1:
+                    final_robot_center = test_center
+                    off_str = f"+{offset:.2f}" if offset >= 0 else f"{offset:.2f}"
+                    robot_choice = f"Front(Y) {off_str}"
+                    found_spot = True
+                    break
+        
+        # Final Decision
+        if not found_spot:
+            print(f"{log_prefix} Skipped: Robot location blocked in all X and Y search positions.")
+            continue
+            
         reasons.append(f"Robot: {robot_choice}")
 
         # --- D. Save ---
@@ -431,9 +451,11 @@ def generate_workspaces(scene_usd_path):
 
         ws_stage = Usd.Stage.CreateNew(workspace_path)
         ws_stage.SetDefaultPrim(ws_stage.DefinePrim("/Workspace", "Xform"))
+
         create_colored_box_mesh(ws_stage, "/Workspace/FunctionSpace", fc, fs, (1.0, 0.0, 0.0))
         create_colored_box_mesh(ws_stage, "/Workspace/DisturbSpace", dc, ds, (0.0, 1.0, 0.0))
         create_colored_box_mesh(ws_stage, "/Workspace/RobotLocation", final_robot_center, robot_size, (0.0, 0.0, 1.0))
+
         ws_stage.GetRootLayer().Save()
         
         print(f"  -> Generated {workspace_name}: " + " | ".join(reasons))
