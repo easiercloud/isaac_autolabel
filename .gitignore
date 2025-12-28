@@ -3,6 +3,10 @@
 
 # 但不忽略我们想要管理的文件
 !auto_workspace_annotator.py
+!batch_run.py
+!batch_run.sh
+!inspect_usd_structure.py
+
 
 # 不忽略 .gitignore 文件本身
 !.gitignore
